@@ -1,0 +1,1884 @@
+class C_SQLParser
+lexid Spaces
+
+//%SUBQUERY_
+//%ERR_RECOVER_
+%IGNORE_KEYWORD_CASE
+%ERROR_TOKEN
+
+%SCANNEROPTION  [[
+%NAMEPREFIX     SQL
+
+unquoted_id = (alpha|'$') (alpha|dec_digit|'$')*    >>bux::createPlainString<TID_LEX_Id,CHAR_TYPE>
+mysql_id    = '`' [^'`']+ '`'                       >>bux::createEscapeString<TID_LEX_Id,CHAR_TYPE>
+sqlite_id   = '\"' [^'\"']+ '\"'                    >>bux::createEscapeString<TID_LEX_Id,CHAR_TYPE,1,1>
+msaccess_id = '[' [^']']+ ']'                       >>bux::createEscapeString<TID_LEX_Id,CHAR_TYPE,1,1>
+str_as_id   = '\'' [^'\'']+ '\''                    >>bux::createEscapeString<TID_LEX_String,CHAR_TYPE,1,1>
+]]
+%EXTRA_TOKENS   [[dec_num|unquoted_id|mysql_id|sqlite_id|msaccess_id|str_as_id|spaces]]
+//%SHOW_UNDEFINED
+
+%HEADERS_FOR_CPP [[
+#include "SqlObjs.h"
+//--------------------------------------------------
+#include <bux/LogStream.h>  // HRTN()
+#include <optional>         // std::optional<>
+]]
+%LOCAL_CPP [[
+//
+//      In-Module Constants
+//
+const E_PrimaryUniqueAttr PUA_PRIMARY_KEY_AUTOINC = E_PrimaryUniqueAttr(PUA_PRIMARY_KEY + (1<<6));
+
+//
+//      In-Module Types
+//
+typedef std::vector<std::pair<std::function<bool(C_CreateTable&)>,bux::C_SourcePos>> C_CreateTableAddOns;
+typedef std::vector<std::pair<std::function<bool(C_ConstraintDef&)>,bux::C_SourcePos>> C_IndexOptions;
+
+struct C_OpLex: bux::I_LexAttr
+{
+    constexpr C_OpLex(const char *op): m_op(op) {}
+    const char *const m_op;
+};
+
+enum E_TableDefault
+{
+    TD_CHARSET,
+    TD_COLLATE
+};
+typedef std::pair<std::string,E_TableDefault> C_TableDefValue;
+
+typedef std::function<void(const std::string &name, C_LexPtr &type, C_RetLval ret)> F_CreateColumn;
+
+//
+//      In-Module Functions
+//
+const char *getOp(const C_LexPtr &lex)
+{
+    return dynamic_cast<const C_OpLex&>(*lex).m_op;
+}
+]]
+
+%ON_ERROR [[
+    RUNTIME_ERROR("({},{}): {}", $pos.m_Line, $pos.m_Col, $message);
+]]
+
+//
+//      Operator Precedency (adopted from https://mariadb.com/kb/en/mariadb/operator-precedence/)
+//
+left    || OR
+left    XOR
+left    && AND
+prec    BETWEEN CASE WHEN THEN ELSE END
+prec    = == <=> >= > <= < <> != IS LIKE GLOB REGEXP MATCH RLIKE IN NOT
+prec    ESCAPE
+left    |
+left    &
+prec    << >>
+left    + -
+left    * / DIV % MOD
+left    ^
+prec    COLLATE
+// NOT is set to the same priority as LIKE, REGEXP, RLIKE, and IN to trick parsergen
+
+//
+//      Grammar with Semantic Rules
+//
+// (P.S. DUAL, TRUE, FALSE are knowingly not listed as keywords.)
+<Line> ::= <SQL>    [[
+    $r = $1;
+]]
+<Line> ::= <SQL> ;  [[
+    $r = $1;
+]]
+
+<SQL> ::= <CreateStmt> [[
+    $r = $1;
+]]
+<SQL> ::= <Select>  [[
+    $r = new C_ClauseAsCmd($1);
+]]
+
+<CreateStmt> ::= CREATE <OrReplace> <Algorithm> <Definer> <Security> VIEW <IfNotExists> <TableName> <ColumnList> AS <Select> <WithCheckOption> [[
+    auto t = std::make_shared<C_CreateView>($8, $11);
+    if ($2)
+        t->enable(CTA_CREATE_OR_REPLACE);
+    if ($3)
+        t->algorithm(bux::unlex<E_Algorithm>($3));
+    if ($5)
+        t->security(bux::unlex<E_SqlSecurity>($5));
+    if ($7)
+        t->enable(CTA_CREATE_IF_NOT_EXISTS);
+    if ($9)
+        t->columnList(bux::unlex<C_StrQ>($9));
+    if ($12)
+        t->checkOption(bux::unlex<E_CheckOption>($12));
+
+    t->definer($4);
+    $r = t;
+]]
+<CreateStmt> ::= CREATE <OrReplace> <Temporary> TABLE <IfNotExists> <TableName> ( <CreateDefList> ) <TableAddOns> [[
+    auto t = std::make_shared<C_CreateTable>($6, bux::unlex<C_SqlClauseQ>($8));
+    if ($2)
+        t->enable(CTA_CREATE_OR_REPLACE);
+    if ($3)
+        t->enable(CTA_TEMPORARY);
+    if ($5)
+        t->enable(CTA_CREATE_IF_NOT_EXISTS);
+    for (auto &i: bux::unlex<C_CreateTableAddOns>($10))
+        if (!i.first(*t))
+            $p.onError(i.second, "Inconsistent table option value");
+
+    $r = t;
+]]
+
+<TableAddOns> ::= [[
+    $r = bux::createLex<C_CreateTableAddOns>();
+]]
+<TableAddOns> ::= <TableAddOns> <TableDefault>  [[
+    auto dst = dupLex<C_CreateTableAddOns>(*$1);
+    auto &src = bux::unlex<C_TableDefValue>($2);
+    switch (src.second)
+    {
+    case TD_CHARSET:
+        dst->m_data.emplace_back([s=src.first](C_CreateTable &ct) {
+            return ct.charset(s);
+        }, $2);
+        break;
+    case TD_COLLATE:
+        dst->m_data.emplace_back([s=src.first](C_CreateTable &ct) {
+            return ct.collate(s);
+        }, $2);
+        break;
+    }
+    $r = dst;
+]]
+<TableAddOns> ::= <TableAddOns> DEFAULT <TableDefault>  [[
+    auto dst = dupLex<C_CreateTableAddOns>(*$1);
+    auto &src = bux::unlex<C_TableDefValue>($3);
+    switch (src.second)
+    {
+    case TD_CHARSET:
+        dst->m_data.emplace_back([s=src.first](C_CreateTable &ct) {
+            if (ct.charset(s))
+            {
+                ct.enable(CTA_DEFAULT_CHARSET);
+                return true;
+            }
+            return false;
+        }, $2);
+        break;
+    case TD_COLLATE:
+        dst->m_data.emplace_back([s=src.first](C_CreateTable &ct) {
+            if (ct.collate(s))
+            {
+                ct.enable(CTA_DEFAULT_COLLATE);
+                return true;
+            }
+            return false;
+        }, $2);
+        break;
+    }
+    $r = dst;
+]]
+<TableAddOns> ::= <TableAddOns> <EngineKeyword> <OptionalEqSign> <Id>   [[
+    auto dst = dupLex<C_CreateTableAddOns>(*$1);
+    dst->m_data.emplace_back([s=bux::unlex<std::string>($4)](C_CreateTable &ct) {
+        return ct.engine(s);
+    }, $2);
+    $r = dst;
+]]
+<TableAddOns> ::= <TableAddOns> COMMENT <OptionalEqSign> $String        [[
+    auto dst = dupLex<C_CreateTableAddOns>(*$1);
+    dst->m_data.emplace_back([s=bux::unlex<std::string>($4)](C_CreateTable &ct) {
+        ct.comment(s);
+        return true;
+    }, $2);
+    $r = dst;
+]]
+<TableAddOns> ::= <TableAddOns> AUTO_INCREMENT <OptionalEqSign> $Num    [[
+    auto dst = dupLex<C_CreateTableAddOns>(*$1);
+    dst->m_data.emplace_back([i=toInt($4)](C_CreateTable &ct) {
+        return ct.autoInc(i);
+    }, $2);
+    $r = dst;
+]]
+//%%%%% et cetera
+
+<TableDefault> ::= <CharSetKeyword> <OptionalEqSign> <Id>   [[
+    $r = bux::createLex<C_TableDefValue>(bux::unlex<std::string>($3), TD_CHARSET);
+]]
+<TableDefault> ::= COLLATE <OptionalEqSign> <Id>            [[
+    $r = bux::createLex<C_TableDefValue>(bux::unlex<std::string>($3), TD_COLLATE);
+]]
+
+<Select> ::= SELECT <SelectDistinct> <HighPriority> <StraightJoin> <SqlSmallResult> <SqlBigResult> <SqlBufferResult> <SqlCache> <SqlCalcFoundRows> <SelectExprList> <IntoVars> <From>   [[
+    auto t = std::make_shared<C_Select>(bux::unlex<C_LexList>($10));
+    if ($2)
+        t->enable(bux::unlex<int>($2));
+    if ($3)
+        t->enable(SELATTR_HIGH_PRIORITY);
+    if ($4)
+        t->enable(SELATTR_STRAIGHT_JOIN);
+    if ($5)
+        t->enable(SELATTR_SQL_SMALL_RESULT);
+    if ($6)
+        t->enable(SELATTR_SQL_BIG_RESULT);
+    if ($7)
+        t->enable(SELATTR_SQL_BUFFER_RESULT);
+    if ($8)
+        t->enable(bux::unlex<int>($8));
+    if ($9)
+        t->enable(SELATTR_SQL_CALC_FOUND_ROWS);
+
+    // $11 is ignored (not supported)
+    if ($12)
+        t->from($12);
+
+    $r = t;
+]]
+
+<SelectDistinct> ::=                [[]]
+<SelectDistinct> ::= ALL            [[
+    $r = bux::createLex(int(SELATTR_ALL));
+]]
+<SelectDistinct> ::= DISTINCT       [[
+    $r = bux::createLex(int(SELATTR_DISTINCT));
+]]
+<SelectDistinct> ::= DISTINCTROW    [[
+    $r = bux::createLex(int(SELATTR_DISTINCTROW));
+]]
+
+<HighPriority> ::=                  [[]]
+<HighPriority> ::= HIGH_PRIORITY    [[
+    $r = new bux::I_LexAttr;
+]]
+
+<StraightJoin> ::=                  [[]]
+<StraightJoin> ::= STRAIGHT_JOIN    [[
+    $r = new bux::I_LexAttr;
+]]
+
+<SqlSmallResult> ::=                    [[]]
+<SqlSmallResult> ::= SQL_SMALL_RESULT   [[
+    $r = new bux::I_LexAttr;
+]]
+
+<SqlBigResult> ::=                      [[]]
+<SqlBigResult> ::= SQL_BIG_RESULT       [[
+    $r = new bux::I_LexAttr;
+]]
+
+<SqlBufferResult> ::=                   [[]]
+<SqlBufferResult> ::= SQL_BUFFER_RESULT [[
+    $r = new bux::I_LexAttr;
+]]
+
+<SqlCache> ::=              [[]]
+<SqlCache> ::= SQL_CACHE    [[
+    $r = bux::createLex(int(SELATTR_SQL_CACHE));
+]]
+<SqlCache> ::= SQL_NO_CACHE [[
+    $r = bux::createLex(int(SELATTR_SQL_NO_CACHE));
+]]
+
+<SqlCalcFoundRows> ::=                      [[]]
+<SqlCalcFoundRows> ::= SQL_CALC_FOUND_ROWS  [[
+    $r = new bux::I_LexAttr;
+]]
+
+<From> ::= [[]]
+<From> ::= FROM <TableRefList> <Partition> <QueryPlan> <Where> <GroupBy> <OrderBy> <Limit> <Procedure> <Into> <SelectLockType>  [[
+    auto t = std::make_shared<C_From>(bux::unlex<C_LexList>($2));
+    if ($3)
+        t->partition(bux::unlex<C_StrQ>($3));
+    if ($4)
+        t->queryPlan($4);
+    if ($5)
+        t->where($5);
+    if ($6)
+        t->groupBy($6);
+    if ($7)
+        t->orderBy(bux::unlex<C_LexList>($7));
+    if ($8)
+        t->limit($8);
+    if ($9)
+        t->procedure($9);
+
+    // $10 is knowingly ignored
+    if ($11)
+        t->selectLockType(getOp($11));
+
+    $r = t;
+]]
+
+<GroupBy> ::= [[]]
+<GroupBy> ::= GROUP BY <OrderExprList> <WithRollUp> <Having>    [[
+    auto t = std::make_shared<C_GroupBy>(bux::unlex<C_LexList>($3));
+    if ($4)
+        t->withRollUp();
+    if ($5)
+        t->having($5);
+
+    $r = t;
+]]
+
+<WithRollUp> ::= [[]]
+<WithRollUp> ::= WITH ROLLUP    [[
+    $r = new bux::I_LexAttr;
+]]
+
+<Having> ::= [[]]
+<Having> ::= HAVING <Expr>  [[
+    $r = $2;
+]]
+
+<OrderBy> ::= [[]]
+<OrderBy> ::= ORDER BY <OrderExprList>  [[
+    $r = $3;
+]]
+
+<OrderExprList> ::= <OrderExpr> [[
+    $r = bux::createLex<C_LexList>({$1});
+]]
+<OrderExprList> ::= <OrderExprList> , <OrderExpr>   [[
+    auto t = dupLex<C_LexList>(*$1);
+    t->m_data.emplace_back($3);
+    $r = t;
+]]
+
+<OrderExpr> ::= <Expr>  [[
+    $r = $1;
+]]
+<OrderExpr> ::= <Expr> <AscDesc>    [[
+    $r = new C_UnaryOp($1, getOp($2));
+]]
+
+<Limit> ::=                         [[]]
+<Limit> ::= LIMIT $Num              [[
+    $r = new C_Limit(toInt($2));
+]]
+<Limit> ::= LIMIT $Num , $Num       [[
+    $r = new C_Limit(toInt($2), toInt($4), false);
+]]
+<Limit> ::= LIMIT $Num OFFSET $Num  [[
+    $r = new C_Limit(toInt($2), toInt($4), true);
+]]
+
+<Procedure> ::= [[]]
+<Procedure> ::= PROCEDURE $Id ( <ExprList> )   [[
+    auto &name = bux::unlex<std::string>($2);
+    $r = $4? new C_FunctionCall(name, bux::unlex<C_LexList>($4)):
+             new C_FunctionCall(name);
+]]
+
+<TableRefList> ::= <TableRef>   [[
+    $r = bux::createLex<C_LexList>({$1});
+]]
+<TableRefList> ::= <TableRefList> , <TableRef>  [[
+    auto t = dupLex<C_LexList>(*$1);
+    t->m_data.emplace_back($3);
+    $r = t;
+]]
+
+<TableRef> ::= <TableFactor>  [[
+    $r = $1;
+]]
+<TableRef> ::= <TableRef> NATURAL JOIN <TableFactor>     [[
+    C_LexPtr _;
+    $r = new C_JoinExpr($1, "NATURAL JOIN", $4, _);
+]]
+<TableRef> ::= <TableRef> NATURAL <OuterJoinQualifier> JOIN <TableFactor> [[
+    C_LexPtr _;
+    $r = new C_JoinExpr($1, "NATURAL "+std::string(getOp($3))+" JOIN", $5, _);
+]]
+<TableRef> ::= <TableRef> <InnerCrossJoinOp> <TableFactor>  [[
+    C_LexPtr _;
+    $r = new C_JoinExpr($1, getOp($2), $3, _);
+]]
+<TableRef> ::= <TableRef> <OuterJoinQualifier> JOIN <TableRef> <JoinCond>   [[
+    $r = new C_JoinExpr($1, std::string(getOp($2)) + " JOIN", $4, $5);
+]]
+<TableRef> ::= <TableRef> <InnerCrossJoinOp> <TableFactor> <JoinCond>       [[
+    $r = new C_JoinExpr($1, getOp($2), $3, $4);
+]]
+<TableRef> ::= <TableRef> STRAIGHT_JOIN <TableFactor> <OptionalOnClause>    [[
+    $r = new C_JoinExpr($1, "STRAIGHT_JOIN", $3, $4);
+]]
+
+<OptionalOnClause> ::=              [[]]
+<OptionalOnClause> ::= ON <Expr>    [[
+    $r = new C_OnCond($2);
+]]
+
+<InnerCrossJoinOp> ::= JOIN         [[
+    $r = new C_OpLex("JOIN");
+]]
+<InnerCrossJoinOp> ::= INNER JOIN   [[
+    $r = new C_OpLex("INNER JOIN");
+]]
+<InnerCrossJoinOp> ::= CROSS JOIN   [[
+    $r = new C_OpLex("CROSS JOIN");
+]]
+
+<JoinCond> ::= ON <Expr>            [[
+    $r = new C_OnCond($2);
+]]
+<JoinCond> ::= USING ( <IdList> )   [[
+    $r = new C_UsingCond(bux::unlex<C_StrQ>($3));
+]]
+
+<OuterJoinQualifier> ::= LEFT           [[
+    $r = new C_OpLex("LEFT");
+]]
+<OuterJoinQualifier> ::= LEFT OUTER     [[
+    $r = new C_OpLex("LEFT OUTER");
+]]
+<OuterJoinQualifier> ::= RIGHT          [[
+    $r = new C_OpLex("RIGHT");
+]]
+<OuterJoinQualifier> ::= RIGHT OUTER    [[
+    $r = new C_OpLex("RIGHT OUTER");
+]]
+
+<TableFactor> ::= <TableName>                   [[
+    $r = $1;
+]]
+<TableFactor> ::= <TableName> <AsId>            [[
+    auto &as = bux::unlex<std::pair<bool,std::string>>($2);
+    $r = new C_AliasedExpr($1, as.second, as.first);
+]]
+<TableFactor> ::= ( <TableRefList> ) [[
+    $r = new C_Parentheses($2);
+]]
+#ifdef SUBQUERY_
+<TableFactor> ::= <Select> <AsId>                   [[
+    auto &as = bux::unlex<std::pair<bool,std::string>>($2);
+    $r = new C_AliasedExpr($1, as.second, as.first);
+]]
+/* Pass this one while figuring out what it means
+<TableFactor> ::= { ON table_reference LEFT OUTER JOIN table_reference ON conditional_expr } */
+#endif
+
+<Partition> ::=                         [[]]
+<Partition> ::= PARTITION ( <IdList> )  [[
+    $r = $3;
+]]
+
+<QueryPlan> ::= [[]]
+<QueryPlan> ::= <QueryPlanVerb> INDEX <QueryPlanFor> ( <IdList> )   [[
+    auto t = std::make_shared<C_QueryPlan>(getOp($1), bux::unlex<C_StrQ>($5));
+    if ($3)
+        t->target(getOp($3));
+
+    $r = t;
+]]
+
+<QueryPlanVerb> ::= USE     [[
+    $r = new C_OpLex("USE");
+]]
+<QueryPlanVerb> ::= FORCE   [[
+    $r = new C_OpLex("FORCE");
+]]
+<QueryPlanVerb> ::= IGNORE  [[
+    $r = new C_OpLex("IGNORE");
+]]
+
+<QueryPlanFor>  ::=                     [[]]
+<QueryPlanFor>  ::= FOR <QueryPlanType> [[
+    $r = $2;
+]]
+
+<QueryPlanType>  ::= JOIN       [[
+    $r = new C_OpLex("FOR JOIN");
+]]
+<QueryPlanType>  ::= ORDER BY   [[
+    $r = new C_OpLex("FOR ORDER BY");
+]]
+<QueryPlanType>  ::= GROUP BY   [[
+    $r = new C_OpLex("FOR GROUP BY");
+]]
+
+<Where> ::=                 [[]]
+<Where> ::= WHERE <Expr>    [[
+    $r = $2;
+]]
+
+<Into> ::= [[]]
+#ifdef ERR_RECOVER_
+<Into> ::= INTO <IntoPhrase>    [[]]
+
+<IntoPhrase> ::= OUTFILE $String $Error     [[
+    // [CHARACTER SET charset_name] [export_options]
+    $p.onError($1, "INTO OUTFILE not supported");
+]]
+<IntoPhrase> ::= DUMPFILE $String $Error    [[
+    $p.onError($1, "INTO DUMPFILE not supported");
+]]
+<IntoPhrase> ::= <IdList> $Error            [[
+    $p.onError($1, "INTO variables within FROM phrase not supported");
+]]
+#endif
+
+<IntoVars> ::=                      [[]]
+<IntoVars> ::= INTO <IdList> $Error [[
+    $p.onError($1, "INTO variables not supported");
+]]
+
+<SelectLockType> ::=                    [[]]
+<SelectLockType> ::= FOR UPDATE         [[
+    $r = new C_OpLex("FOR UPDATE");
+]]
+<SelectLockType> ::= LOCK IN SHARE MODE [[
+    $r = new C_OpLex("LOCK IN SHARE MODE");
+]]
+
+<OrReplace> ::=             [[]]
+<OrReplace> ::= OR REPLACE  [[
+    $r = new bux::I_LexAttr;
+]]
+
+<Temporary> ::=             [[]]
+<Temporary> ::= TEMPORARY   [[
+    $r = new bux::I_LexAttr;
+]]
+
+<IfNotExists> ::=               [[]]
+<IfNotExists> ::= IF NOT EXISTS [[
+    $r = new bux::I_LexAttr;
+]]
+
+<TableName> ::= <Id> . <Id> [[
+    C_StrQ t{{bux::unlex<std::string>($1), bux::unlex<std::string>($3)}};
+    $r = new C_Id(std::move(t), IK_TABLEWISE);
+]]
+<TableName> ::= <Id>        [[
+    $r = new C_Id(bux::unlex<std::string>($1), IK_TABLEWISE);
+]]
+
+<ColumnList> ::=                [[]]
+<ColumnList> ::= ( <IdList> )   [[
+    $r = $2;
+]]
+
+<IdList> ::= <Id>               [[
+    $r = bux::createLex<C_StrQ>({bux::unlex<std::string>($1)});
+]]
+<IdList> ::= <IdList> , <Id>    [[
+    auto t = dupLex<C_StrQ>(*$1);
+    t->m_data.emplace_back(bux::unlex<std::string>($3));
+    $r = t;
+]]
+
+<Algorithm> ::=                         [[]]
+<Algorithm> ::= ALGORITHM = <AlgoType>  [[
+    $r = $3;
+]]
+
+<AlgoType> ::= UNDEFINED    [[
+    $r = bux::createLex(ALGORITHM_UNDEFINED);
+]]
+<AlgoType> ::= MERGE        [[
+    $r = bux::createLex(ALGORITHM_MERGE);
+]]
+<AlgoType> ::= TEMPTABLE    [[
+    $r = bux::createLex(ALGORITHM_TEMPTABLE);
+]]
+
+<Definer> ::=                           [[]]
+<Definer> ::= DEFINER = <DefinerValue>  [[
+    $r = $3;
+]]
+
+<DefinerValue> ::= $String      [[
+    $r = $1;
+]]
+<DefinerValue> ::= CURRENT_USER [[
+    $r = new bux::I_LexAttr;
+]]  // magic
+
+<Security> ::= [[]]
+<Security> ::= SQL SECURITY <SecurityType>  [[
+    $r = $3;
+]]
+
+<SecurityType> ::= DEFINER  [[
+    $r = bux::createLex(SQL_SECURITY_DEFINER);
+]]
+<SecurityType> ::= INVOKER  [[
+    $r = bux::createLex(SQL_SECURITY_INVOKER);
+]]
+
+<WithCheckOption> ::= [[]]
+<WithCheckOption> ::= WITH <CheckFlavor> CHECK OPTION   [[
+    $r = $2;
+]]
+
+<CheckFlavor> ::=           [[
+    $r = bux::createLex(CHKOPT_PLAIN);
+]]
+<CheckFlavor> ::= CASCADED  [[
+    $r = bux::createLex(CHKOPT_CASCADED);
+]]
+<CheckFlavor> ::= LOCAL     [[
+    $r = bux::createLex(CHKOPT_LOCAL);
+]]
+
+<EngineKeyword> ::= ENGINE          [[]] // ignorable
+<EngineKeyword> ::= STORAGE ENGINE  [[]] // ignorable
+
+<CreateDefList> ::= <CreateDef> [[
+    if (auto def = std::dynamic_pointer_cast<const I_SqlClause>($1.m_attr))
+        $r = bux::createLex<C_SqlClauseQ>({{def}});
+    else
+        $p.onError($1, "Null <CreateDef>");
+]]
+<CreateDefList> ::= <CreateDefList> , <CreateDef> [[
+    if (auto def = std::dynamic_pointer_cast<const I_SqlClause>($3.m_attr))
+    {
+        auto t = dupLex<C_SqlClauseQ>(*$1);
+        t->m_data.emplace_back(def);
+        $r = t;
+    }
+    else if ($3)
+        $p.onError($3, "Unhandled <CreateDef> type " + HRTN(*$3));
+    else
+        $p.onError($3, "Null <CreateDef>");
+]]
+
+<CreateDef> ::= <ColumnId> <DataType> <ColumnDef> [[
+    bux::unlex<F_CreateColumn>($3)(bux::unlex<std::string>($1), $2, $r);
+]]
+<CreateDef> ::= <IndexKey> <OptionalId> <IndexType> ( <IndexColNameList> ) <IndexOptions> [[
+    auto t = std::make_shared<C_ConstraintDef>(SCK_INDEX, bux::tryUnlex<std::string>($2), bux::unlex<C_IndexColumns>($5));
+    if ($3 && !t->indexType(bux::unlex<E_InexUsing>($3)))
+        $p.onError($3, "Init using type error");
+
+    for (auto &i: bux::unlex<C_IndexOptions>($7))
+        if (!i.first(*t))
+            $p.onError(i.second, "Inconsistent index option value");
+
+    $r = t;
+]]
+<CreateDef> ::= <FulltextSpatial> <OptionalIndexKey> <OptionalId> ( <IndexColNameList> ) <IndexOptions> [[
+    auto t = std::make_shared<C_ConstraintDef>(bux::unlex<E_SqlConstraintKind>($1), bux::tryUnlex<std::string>($3), bux::unlex<C_IndexColumns>($5));
+    for (auto &i: bux::unlex<C_IndexOptions>($7))
+        if (!i.first(*t))
+            $p.onError(i.second, "Inconsistent index option value");
+
+    $r = t;
+]]
+<CreateDef> ::= <Constraint> PRIMARY KEY <IndexType> ( <IndexColNameList> ) <IndexOptions> [[
+    auto t = std::make_shared<C_ConstraintDef>(SCK_PRIMARY_KEY, nullptr, bux::unlex<C_IndexColumns>($6));
+    if (auto pstr = bux::tryUnlex<std::string>($1))
+        t->constraintName(*pstr);
+    if ($4 && !t->indexType(bux::unlex<E_InexUsing>($4)))
+        $p.onError($4, "Init using type error");
+
+    for (auto &i: bux::unlex<C_IndexOptions>($8))
+        if (!i.first(*t))
+            $p.onError(i.second, "Inconsistent index option value");
+
+    $r = t;
+]]
+<CreateDef> ::= <Constraint> UNIQUE <OptionalIndexKey> <OptionalId> <IndexType> ( <IndexColNameList> ) <IndexOptions> [[
+    auto t = std::make_shared<C_ConstraintDef>(SCK_UNIQUE_KEY, bux::tryUnlex<std::string>($4), bux::unlex<C_IndexColumns>($7));
+    if (auto pstr = bux::tryUnlex<std::string>($1))
+        t->constraintName(*pstr);
+    if ($5 && !t->indexType(bux::unlex<E_InexUsing>($5)))
+        $p.onError($5, "Init using type error");
+
+    for (auto &i: bux::unlex<C_IndexOptions>($9))
+        if (!i.first(*t))
+            $p.onError(i.second, "Inconsistent index option value");
+
+    $r = t;
+]]
+<CreateDef> ::= <Constraint> FOREIGN KEY <OptionalId> ( <IndexColNameList> ) <ReferenceDef> [[
+    auto t = std::make_shared<C_ConstraintDef>(SCK_FOREIGN_KEY, bux::tryUnlex<std::string>($4), bux::unlex<C_IndexColumns>($6));
+    if (auto pstr = bux::tryUnlex<std::string>($1))
+        t->constraintName(*pstr);
+
+    t->references($8);
+    $r = t;
+]]
+<CreateDef> ::= CHECK ( <Expr> )    [[
+    $r = new C_CheckDef($3);
+]]
+
+<ColumnId> ::= <Id> [[
+    $r = $1;
+]]
+// Arphic-only column name(s)
+<ColumnId> ::= DESC [[
+    $r = $1;
+]]
+
+<ColumnDef> ::= <Nullity> <DefaultDef> <AutoInc> <PrimaryUnique> <Comment> <ColFormat> <OptionalReferenceDef>   [[
+    std::optional<bool> nullity;
+    if ($1)
+        nullity = bux::unlex<bool>($1);
+
+    bool autoInc = $3;
+    std::optional<E_PrimaryUniqueAttr> keyType;
+    if ($4)
+    {
+        keyType = bux::unlex<E_PrimaryUniqueAttr>($4);
+        if (keyType == PUA_PRIMARY_KEY_AUTOINC)
+        {
+            if (autoInc)
+                // Syntax error
+                $p.onError($3, "Repeated AUTOINCREMENT");
+
+            keyType = PUA_PRIMARY_KEY;
+            autoInc = true;
+        }
+    }
+    std::optional<std::string> comment;
+    if ($5)
+        comment = bux::unlex<std::string>($5);
+
+    std::optional<E_ColFormat> colFormat;
+    if ($6)
+        colFormat = bux::unlex<E_ColFormat>($6);
+
+    struct C_LexPack
+    {
+        C_LexPtr    m_defVal, m_ref;
+    };
+    std::shared_ptr<C_LexPack> lexs(new C_LexPack);
+    lexs->m_defVal = $2;
+    lexs->m_ref = $7;
+    auto defPos = $2.m_pos;
+
+    $r = bux::createLex<F_CreateColumn>([=,&$p](const std::string &name, C_LexPtr &type, C_RetLval ret){
+        auto t = std::make_shared<C_ColumnDef>(name, type);
+        if (nullity)
+            t->setNullity(*nullity);
+        if (lexs->m_defVal &&
+            !t->setDefault(lexs->m_defVal))
+            $p.onError(defPos, t->lastError());
+        if (autoInc)
+            t->autoInc();
+        if (keyType)
+            t->setKeyType(*keyType);
+        if (comment)
+            t->comment(*comment);
+        if (colFormat)
+            t->setColumFormat(*colFormat);
+        if (lexs->m_ref)
+            t->references(lexs->m_ref);
+
+        ret = t;
+    });
+]]
+<ColumnDef> ::= <Generatedness> AS ( <Expr> ) <VirtualPersistent> <Uniqueness> <Comment> [[
+    struct C_LexPack
+    {
+        C_LexPtr    m_expr;
+    };
+    std::shared_ptr<C_LexPack> lexs(new C_LexPack);
+    lexs->m_expr = $4;
+
+    auto mode = bux::unlex<E_GenColumnMode>($6);
+    bool unique = $7;
+    std::optional<std::string> comment;
+    if ($8)
+        comment = bux::unlex<std::string>($8);
+
+    $r = bux::createLex<F_CreateColumn>([=](const std::string &name, C_LexPtr &type, C_RetLval ret){
+        auto t = std::make_shared<C_GenColumnDef>(name, type, lexs->m_expr, mode);
+        if (unique)
+            (void)t->unique();
+        if (comment)
+            (void)t->comment(*comment);
+
+        ret = t;
+    });
+]]
+
+<IndexOptions> ::= [[
+    $r = bux::createLex<C_IndexOptions>();
+]]
+<IndexOptions> ::= <IndexOptions> KEY_BLOCK_SIZE <OptionalEqSign> $Num [[
+    auto dst = dupLex<C_IndexOptions>(*$1);
+    dst->m_data.emplace_back(
+        [size=toInt($4)](C_ConstraintDef &def) {
+            return def.keyBlockSize(size);
+        }, $2);
+    $r = dst;
+]]
+<IndexOptions> ::= <IndexOptions> USING <IndexTypeName> [[
+    auto dst = dupLex<C_IndexOptions>(*$1);
+    dst->m_data.emplace_back(
+        [type=bux::unlex<E_InexUsing>($3)](C_ConstraintDef &def) {
+            return def.indexType(type);
+        }, $2);
+    $r = dst;
+]]
+<IndexOptions> ::= <IndexOptions> WITH PARSER <Id> [[
+    auto dst = dupLex<C_IndexOptions>(*$1);
+    dst->m_data.emplace_back(
+        [s=bux::unlex<std::string>($4)](C_ConstraintDef &def) {
+            return def.parserName(s);
+        }, $2);
+    $r = dst;
+]]
+
+<OptionalId> ::=        [[]]
+<OptionalId> ::= <Id>   [[
+    $r = $1;
+]]
+
+<FulltextSpatial> ::= FULLTEXT  [[
+    $r = bux::createLex(SCK_FULLTEXT);
+]]
+<FulltextSpatial> ::= SPATIAL   [[
+    $r = bux::createLex(SCK_SPATIAL);
+]]
+
+<Constraint> ::= [[]]
+<Constraint> ::= CONSTRAINT <OptionalId>    [[
+    $r = $2;
+]]
+
+<OptionalIndexKey> ::=                  [[]]
+<OptionalIndexKey> ::= <IndexKey>       [[]] // ignorable
+
+<IndexKey> ::=  INDEX                   [[]] // ignorable
+<IndexKey> ::=  KEY                     [[]] // ignorable
+
+<Generatedness> ::=                     [[]]
+<Generatedness> ::= GENERATED ALWAYS    [[]] // ignorable
+
+<VirtualPersistent> ::= VIRTUAL     [[
+    $r = bux::createLex(GCM_VIRTUAL);
+]]
+<VirtualPersistent> ::= PERSISTENT  [[
+    $r = bux::createLex(GCM_PERSISTENT);
+]]
+
+<IndexType> ::=                         [[]]
+<IndexType> ::= USING <IndexTypeName>   [[
+    $r = $2;
+]]
+
+<IndexTypeName> ::= BTREE   [[
+    $r = bux::createLex(USING_BTREE);
+]]
+<IndexTypeName> ::= HASH    [[
+    $r = bux::createLex(USING_HASH);
+]]
+<IndexTypeName> ::= RTREE   [[
+    $r = bux::createLex(USING_RTREE);
+]]
+
+<DataType> ::= <NumType> <Unsignedness> <ZeroFill>  [[
+    std::shared_ptr<C_DataTypeLex> dst;
+    if (auto src = dynamic_cast<const C_DataTypeLex*>($1.get()))
+        dst.reset(new C_DataTypeLex{*src});
+    else
+        dst.reset(new C_DataTypeLex{bux::unlex<E_DataType>($1)});
+
+    if ($2)
+        dst->enable(DTA_UNSIGNED);
+    if ($3)
+        dst->enable(DTA_ZEROFILL);
+
+    $r = dst;
+]]
+<DataType> ::= BOOL         [[
+    $r = bux::createLex(DT_BOOLEAN);
+]]
+<DataType> ::= BOOLEAN      [[
+    $r = bux::createLex(DT_BOOLEAN);
+]]
+<DataType> ::= BIT <OptionalWidth>  [[
+    if ($2)
+        $r = new C_DataTypeLex(DT_BIT, toInt($2));
+    else
+        $r = bux::createLex(DT_BIT);
+]]
+<DataType> ::= <CharType> <CharSet> <Collate>   [[
+    auto t = std::make_shared<C_LocaleClauseLex>($1);
+    if ($2)
+        t->charset(bux::unlex<std::string>($2));
+    if ($3)
+        t->collate(bux::unlex<std::string>($3));
+
+    $r = t;
+]]
+<DataType> ::= <BinaryType> ( $Num ) [[
+    $r = new C_DataTypeLex(bux::unlex<E_DataType>($1), toInt($3));
+]]
+<DataType> ::= TINYBLOB             [[
+    $r = bux::createLex(DT_TINYBLOB);
+]]
+<DataType> ::= MEDIUMBLOB           [[
+    $r = bux::createLex(DT_MEDIUMBLOB);
+]]
+<DataType> ::= LONGBLOB             [[
+    $r = bux::createLex(DT_LONGBLOB);
+]]
+<DataType> ::= BLOB <OptionalWidth> [[
+    if ($2)
+        $r = new C_DataTypeLex(DT_BLOB, toInt($2));
+    else
+        $r = bux::createLex(DT_BLOB);
+]]
+<DataType> ::= DATE                 [[
+    $r = bux::createLex(DT_DATE);
+]]
+<DataType> ::= <TimeType> <OptionalWidth>   [[
+    if ($2)
+        $r = new C_DataTypeLex(bux::unlex<E_DataType>($1), toInt($2));
+    else
+        $r = $1;
+]]
+<DataType> ::= YEAR <OptionalWidth> [[
+    if ($2)
+        $r = new C_DataTypeLex(DT_YEAR, toInt($2));
+    else
+        $r = bux::createLex(DT_YEAR);
+]]
+<DataType> ::= POINT                [[
+    $r = bux::createLex(DT_POINT);
+]]
+<DataType> ::= LINESTRING           [[
+    $r = bux::createLex(DT_LINESTRING);
+]]
+<DataType> ::= POLYGON              [[
+    $r = bux::createLex(DT_POLYGON);
+]]
+<DataType> ::= MULTIPOINT           [[
+    $r = bux::createLex(DT_MULTIPOINT);
+]]
+<DataType> ::= MULTILINESTRING      [[
+    $r = bux::createLex(DT_MULTILINESTRING);
+]]
+<DataType> ::= MULTIPOLYGON         [[
+    $r = bux::createLex(DT_MULTIPOLYGON);
+]]
+<DataType> ::= GEOMETRYCOLLECTION   [[
+    $r = bux::createLex(DT_GEOMETRYCOLLECTION);
+]]
+<DataType> ::= GEOMETRY             [[
+    $r = bux::createLex(DT_GEOMETRY);
+]]
+
+<NumType> ::= <IntType> <OptionalWidth> [[
+    if ($2)
+        $r = new C_DataTypeLex(bux::unlex<E_DataType>($1), toInt($2));
+    else
+        $r = $1;
+]]
+<NumType> ::= <DecimalType> [[
+    $r = $1;
+]]
+<NumType> ::= <DecimalType> ( $Num )   [[
+    $r = new C_DataTypeLex(bux::unlex<E_DataType>($1), toInt($3));
+]]
+<NumType> ::= <DecimalType> ( $Num , $Num )   [[
+    $r = new C_DataTypeLex(bux::unlex<E_DataType>($1), toInt($3), toInt($5));
+]]
+<NumType> ::= <FloatType> [[
+    $r = $1;
+]]
+<NumType> ::= <FloatType> ( $Num , $Num ) [[
+    $r = new C_DataTypeLex(bux::unlex<E_DataType>($1), toInt($3), toInt($5));
+]]
+
+<IntType> ::= TINYINT       [[
+    $r = bux::createLex(DT_TINYINT);
+]]
+<IntType> ::= SMALLINT      [[
+    $r = bux::createLex(DT_SMALLINT);
+]]
+<IntType> ::= MEDIUMINT     [[
+    $r = bux::createLex(DT_MEDIUMINT);
+]]
+<IntType> ::= INT           [[
+    $r = bux::createLex(DT_INT);
+]]
+<IntType> ::= INTEGER       [[
+    $r = bux::createLex(DT_INTEGER);
+]]
+<IntType> ::= BIGINT        [[
+    $r = bux::createLex(DT_BIGINT);
+]]
+
+<DecimalType> ::= DECIMAL   [[
+    $r = bux::createLex(DT_DECIMAL);
+]]
+<DecimalType> ::= DEC       [[
+    $r = bux::createLex(DT_DECIMAL);
+]]
+<DecimalType> ::= NUMERIC   [[
+    $r = bux::createLex(DT_DECIMAL);
+]]
+<DecimalType> ::= FIXED     [[
+    $r = bux::createLex(DT_DECIMAL);
+]]
+
+<FloatType> ::= FLOAT               [[
+    $r = bux::createLex(DT_FLOAT);
+]]
+<FloatType> ::= DOUBLE <Precision>  [[
+    $r = bux::createLex($2? DT_DOUBLE_PRECISION: DT_DOUBLE);
+]]
+<FloatType> ::= REAL                [[
+    $r = bux::createLex(DT_REAL);
+]]
+
+<Precision> ::=             [[]]
+<Precision> ::= PRECISION   [[
+    $r = new bux::I_LexAttr;
+]]
+
+<CharType> ::= <DefCharType> <OptionalWidth>    [[
+    const auto dt = bux::unlex<E_DataType>($1);
+    if ($2)
+        $r = new C_DataTypeLex(dt, toInt($2));
+    else switch (dt)
+    {
+    case DT_VARCHAR:
+    case DT_VARCHAR2:
+    case DT_NVARCHAR:
+        $p.onError($2, std::string(typeName(dt)) + " must have width specifier");
+        [[fallthrough]];
+    default:
+        $r = $1;
+    }
+]]
+<CharType> ::= TINYTEXT         [[
+    $r = bux::createLex(DT_TINYTEXT);
+]]
+<CharType> ::= MEDIUMTEXT       [[
+    $r = bux::createLex(DT_MEDIUMTEXT);
+]]
+<CharType> ::= LONGTEXT         [[
+    $r = bux::createLex(DT_LONGTEXT);
+]]
+<CharType> ::= <ListType> ( <StringList> ) [[
+    $r = new C_ListTypeLex{bux::unlex<E_ListType>($1), bux::unlex<C_StrQ>($3)};
+]]
+
+<DefCharType> ::= CHAR                      [[
+    $r = bux::createLex(DT_CHAR);
+]]
+<DefCharType> ::= TEXT                      [[
+    $r = bux::createLex(DT_TEXT);
+]]
+<DefCharType> ::= CHARACTER VARYING         [[
+    $r = bux::createLex(DT_VARCHAR);
+]]
+<DefCharType> ::= VARCHAR                   [[
+    $r = bux::createLex(DT_VARCHAR);
+]]
+<DefCharType> ::= VARCHAR2                  [[
+    $r = bux::createLex(DT_VARCHAR2);
+]]
+<DefCharType> ::= NVARCHAR                  [[
+    $r = bux::createLex(DT_NVARCHAR);
+]]
+<DefCharType> ::= NCHAR <NCharType>         [[
+    $r = $2;
+]]
+<DefCharType> ::= NATIONAL <NationalType>   [[
+    $r = $2;
+]]
+
+<NCharType> ::=             [[
+    $r = bux::createLex(DT_NCHAR);
+]]
+<NCharType> ::= VARCHAR     [[
+    $r = bux::createLex(DT_NVARCHAR);
+]]
+
+<NationalType> ::= CHAR <NationalCharType>  [[
+    $r = $2;
+]]
+<NationalType> ::= VARCHAR                  [[
+    $r = bux::createLex(DT_NVARCHAR);
+]]
+<NationalType> ::= CHARACTER VARYING        [[
+    $r = bux::createLex(DT_NVARCHAR);
+]]
+
+<NationalCharType> ::=          [[
+    $r = bux::createLex(DT_NCHAR);
+]]
+<NationalCharType> ::= VARYING  [[
+    $r = bux::createLex(DT_NVARCHAR);
+]]
+
+<BinaryType> ::= BINARY <BinaryVarying> [[
+    $r = bux::createLex($2? DT_VARBINARY: DT_BINARY);
+]]
+/* Not supported to stop complicated shift-shift conflict with CHAR
+<BinaryType> ::= CHAR BYTE  [[
+    $r = bux::createLex(DT_BINARY);
+]]*/
+<BinaryType> ::= VARBINARY  [[
+    $r = bux::createLex(DT_VARBINARY);
+]]
+
+<BinaryVarying> ::=         [[]]
+<BinaryVarying> ::= VARYING [[
+    $r = new bux::I_LexAttr;
+]]
+
+<TimeType> ::= TIME         [[
+    $r = bux::createLex(DT_TIME);
+]]
+<TimeType> ::= DATETIME     [[
+    $r = bux::createLex(DT_DATETIME);
+]]
+<TimeType> ::= TIMESTAMP    [[
+    $r = bux::createLex(DT_TIMESTAMP);
+]]
+
+<ListType> ::= ENUM [[
+    $r = bux::createLex(LT_ENUM);
+]]
+<ListType> ::= SET  [[
+    $r = bux::createLex(LT_SET);
+]]
+
+<StringList> ::= $String                [[
+    $r = bux::createLex<C_StrQ>({bux::unlex<std::string>($1)});
+]]
+<StringList> ::= <StringList> , $String [[
+    auto t = dupLex<C_StrQ>(*$1);
+    t->m_data.emplace_back(bux::unlex<std::string>($3));
+    $r = t;
+]]
+
+<OptionalWidth> ::=             [[]]
+<OptionalWidth> ::= ( $Num )    [[
+    $r = $2;
+]]
+
+<Unsignedness> ::=          [[]]
+<Unsignedness> ::= UNSIGNED [[
+    $r = new bux::I_LexAttr;
+]]
+
+<ZeroFill> ::=              [[]]
+<ZeroFill> ::= ZEROFILL     [[
+    $r = new bux::I_LexAttr;
+]]
+
+<CharSet> ::= [[]]
+<CharSet> ::= <CharSetKeyword> $Id  [[
+    $r = $2;
+]]
+
+<CharSetKeyword> ::= CHARACTER SET  [[]] // ignorable
+<CharSetKeyword> ::= CHARSET        [[]] // ignorable
+
+<Collate> ::=               [[]]
+<Collate> ::= COLLATE $Id   [[
+    $r = $2;
+]]
+
+<Nullity> ::=               [[]]
+<Nullity> ::= NOT NULL      [[
+    $r = bux::createLex(true);
+]]
+<Nullity> ::= NULL          [[
+    $r = bux::createLex(false);
+]]
+
+<DefaultDef> ::= [[]]
+<DefaultDef> ::= DEFAULT <Expr> <OptionalOnUpdate>  [[
+    $r = new C_ColumnDefault(CDO_DEFAULT_FIRST, $2, $3);
+]]
+<DefaultDef> ::= ON UPDATE <Expr> <OptionalDefault> [[
+    $r = new C_ColumnDefault(CDO_ON_UPDATE_FIRST, $3, $4);
+]]
+
+<OptionalOnUpdate> ::= [[]]
+<OptionalOnUpdate> ::= ON UPDATE <Expr> [[
+    $r = $3;
+]]
+
+<OptionalDefault> ::= [[]]
+<OptionalDefault> ::= DEFAULT <Expr> [[
+    $r = $2;
+]]
+
+<Expr> ::= <UnaryRval>  [[
+    $r = $1;
+]]
+<Expr> ::= <UnaryOp> <UnaryRval> [[
+    $r = new C_UnaryOp(getOp($1), $2);
+]]
+<Expr> ::= <Expr> || <Expr>     [[
+    $r = new C_BinaryOp($1, "||", $3);
+]]
+<Expr> ::= <Expr> OR <Expr>     [[
+    $r = new C_BinaryOp($1, "OR", $3);
+]]
+<Expr> ::= <Expr> XOR <Expr>    [[
+    $r = new C_BinaryOp($1, "XOR", $3);
+]]
+<Expr> ::= <Expr> && <Expr>     [[
+    $r = new C_BinaryOp($1, "&&", $3);
+]]
+<Expr> ::= <Expr> AND <Expr>    [[
+    $r = new C_BinaryOp($1, "AND", $3);
+]]
+<Expr> ::= <Expr> = <Expr>      [[
+    $r = new C_BinaryOp($1, "=", $3);
+]]
+<Expr> ::= <Expr> == <Expr>     [[
+    $r = new C_BinaryOp($1, "==", $3);
+]]
+<Expr> ::= <Expr> <=> <Expr>    [[
+    $r = new C_BinaryOp($1, "<=>", $3);
+]]
+<Expr> ::= <Expr> >= <Expr>     [[
+    $r = new C_BinaryOp($1, ">=", $3);
+]]
+<Expr> ::= <Expr> > <Expr>      [[
+    $r = new C_BinaryOp($1, ">", $3);
+]]
+<Expr> ::= <Expr> <= <Expr>     [[
+    $r = new C_BinaryOp($1, "<=", $3);
+]]
+<Expr> ::= <Expr> < <Expr>      [[
+    $r = new C_BinaryOp($1, "<", $3);
+]]
+<Expr> ::= <Expr> <> <Expr>     [[
+    $r = new C_BinaryOp($1, "<>", $3);
+]]
+<Expr> ::= <Expr> != <Expr>     [[
+    $r = new C_BinaryOp($1, "!=", $3);
+]]
+<Expr> ::= <Expr> IS <Expr>     [[
+    $r = new C_BinaryOp($1, "IS", $3);
+]]
+<Expr> ::= <Expr> <MatchOp> <Expr> <Escape>  [[
+    auto t = std::make_shared<C_BinaryOp>($1, getOp($2), $3);
+    if ($4)
+        t->escape($4);
+    $r = t;
+]]
+<Expr> ::= <Expr> NOT <MatchOp> <Expr> <Escape> [[
+    auto t = std::make_shared<C_BinaryOp>($1, getOp($3), $4);
+    t->negate();
+    if ($5)
+        t->escape($5);
+    $r = t;
+]]
+<Expr> ::= <Expr> IN <InRight>  [[
+    $r = new C_BinaryOp($1, "IN", $3);
+]]
+<Expr> ::= <Expr> NOT IN <InRight>  [[
+    auto t = std::make_shared<C_BinaryOp>($1, "IN", $4);
+    t->negate();
+    $r = t;
+]]
+<Expr> ::= <Expr> BETWEEN <Expr> AND <Expr> [[
+    $r = new C_BinaryOp($1, "BETWEEN", std::make_shared<C_BinaryOp>($3, "AND", $5));
+]]
+<Expr> ::= <Expr> NOT BETWEEN <Expr> AND <Expr> [[
+    auto t = std::make_shared<C_BinaryOp>($4, "AND", $6);
+    t = std::make_shared<C_BinaryOp>($1, "BETWEEN", t);
+    t->negate();
+    $r = t;
+]]
+<Expr> ::= <Expr> | <Expr>      [[
+    $r = new C_BinaryOp($1, "|", $3);
+]]
+<Expr> ::= <Expr> & <Expr>      [[
+    $r = new C_BinaryOp($1, "&", $3);
+]]
+<Expr> ::= <Expr> << <Expr>     [[
+    $r = new C_BinaryOp($1, "<<", $3);
+]]
+<Expr> ::= <Expr> >> <Expr>     [[
+    $r = new C_BinaryOp($1, ">>", $3);
+]]
+<Expr> ::= <Expr> + <Expr>      [[
+    $r = new C_BinaryOp($1, "+", $3);
+]]
+<Expr> ::= <Expr> - <Expr>      [[
+    $r = new C_BinaryOp($1, "-", $3);
+]]
+<Expr> ::= <Expr> * <Expr>      [[
+    $r = new C_BinaryOp($1, "*", $3);
+]]
+<Expr> ::= <Expr> / <Expr>      [[
+    $r = new C_BinaryOp($1, "/", $3);
+]]
+<Expr> ::= <Expr> % <Expr>      [[
+    $r = new C_BinaryOp($1, "%", $3);
+]]
+<Expr> ::= <Expr> ^ <Expr>      [[
+    $r = new C_BinaryOp($1, "^", $3);
+]]
+<Expr> ::= <Expr> DIV <Expr>    [[
+    $r = new C_BinaryOp($1, "DIV", $3);
+]]
+<Expr> ::= <Expr> MOD <Expr>    [[
+    $r = new C_BinaryOp($1, "MOD", $3);
+]]
+<Expr> ::= <Expr> COLLATE <Expr>    [[
+    $r = new C_BinaryOp($1, "COLLATE", $3);
+]]
+//%%%%%% Still more to come ...
+
+<MatchOp> ::= LIKE      [[
+    $r = new C_OpLex("LIKE");
+]]
+<MatchOp> ::= GLOB      [[
+    $r = new C_OpLex("GLOB");
+]]
+<MatchOp> ::= MATCH     [[
+    $r = new C_OpLex("MATCH");
+]]
+<MatchOp> ::= REGEXP    [[
+    $r = new C_OpLex("REGEXP");
+]]
+<MatchOp> ::= RLIKE     [[
+    $r = new C_OpLex("RLIKE");
+]]
+
+<Escape> ::=                [[]]
+<Escape> ::= ESCAPE <Expr>  [[
+    $r = $2;
+]]
+
+<InRight> ::= <TableName>               [[
+    $r = $1;
+]]
+<InRight> ::= ( <NonEmptyExprList> )    [[
+    $r = new C_Parentheses($2);
+]]
+#ifdef SUBQUERY_
+<InRight> ::= ( <Select> )              [[
+    $r = new C_Parentheses($2);
+]]
+#endif
+
+<UnaryRval> ::= NULL                [[
+    $r = new C_Null;
+]]
+<UnaryRval> ::= $Num                [[
+    $r = $1;
+]]
+<UnaryRval> ::= ( <UnaryParenthesized> )    [[
+    $r = new C_Parentheses($2);
+]]
+#ifdef SUBQUERY_
+<UnaryRval> ::= EXISTS ( <Select> ) [[
+    auto t = std::make_shared<C_Parentheses>($2);
+    t->exists();
+    $r = t;
+]]
+#endif
+<UnaryRval> ::= <KeywaordAsFunction> ( <ParamList> )   [[
+    const auto funcName = getOp($1);
+    if (auto params = bux::tryUnlex<C_LexList>($3))
+        $r = new C_FunctionCall(funcName, *params);
+    else
+        $r = new C_FunctionCall(funcName);
+]]
+<UnaryRval> ::= <Id> ( <ParamList> )    [[
+    auto funName = bux::unlex<std::string>($1);
+    if ($3)
+        $r = new C_FunctionCall(funName, bux::unlex<C_LexList>($3));
+    else
+        $r = new C_FunctionCall(funName);
+]]
+<UnaryRval> ::= <Id> <IdRight>          [[
+    auto &s1 = bux::unlex<std::string>($1);
+    if (!$2)
+    {
+        if (s1.front() == '\'')
+            // Plain string
+            $r = bux::createLex(bareID(s1));
+        else
+            // Simple form of id
+            $r = new C_Id(s1, IK_UNDER_TABLE);
+    }
+    else
+    {
+        auto ids{bux::unlex<C_StrQ>($2)};
+        ids.insert(ids.begin(), s1);
+        $r = new C_Id{std::move(ids), IK_UNDER_TABLE};
+    }
+]]
+<UnaryRval> ::= "\'\'"              [[
+    $r = bux::createLex(std::string{});
+]]
+<UnaryRval> ::= <WildColumn>        [[
+    $r = new C_Id(getOp($1), IK_UNDER_TABLE);
+]]
+<UnaryRval> ::= CASE <OptionalExpr> <WhenList> <Else> END [[
+    $r = new C_ExprCase($2, bux::unlex<C_LexPairList>($3), $4);
+]]
+
+<UnaryParenthesized> ::= <Expr>     [[
+    $r = $1;
+]]
+#ifdef SUBQUERY_
+<UnaryParenthesized> ::= <Select>   [[
+    $r = $1;
+]]
+#endif
+
+<KeywaordAsFunction> ::= CHAR       [[
+    $r = new C_OpLex("CHAR");
+]]
+<KeywaordAsFunction> ::= DATABASE   [[
+    $r = new C_OpLex("DATABASE");
+]]
+<KeywaordAsFunction> ::= DEFAULT    [[
+    $r = new C_OpLex("DEFAULT");
+]]
+<KeywaordAsFunction> ::= INSERT     [[
+    $r = new C_OpLex("INSERT");
+]]
+<KeywaordAsFunction> ::= LEFT       [[
+    $r = new C_OpLex("LEFT");
+]]
+<KeywaordAsFunction> ::= REPLACE    [[
+    $r = new C_OpLex("REPLACE");
+]]
+<KeywaordAsFunction> ::= RIGHT      [[
+    $r = new C_OpLex("RIGHT");
+]]
+<KeywaordAsFunction> ::= SCHEMA     [[
+    $r = new C_OpLex("SCHEMA");
+]]
+
+<OptionalExpr> ::=          [[]]
+<OptionalExpr> ::= <Expr>   [[
+    $r = $1;
+]]
+
+<WhenList> ::= WHEN <Expr> THEN <Expr>  [[
+    $r = bux::createLex<C_LexPairList>({{$2, $4}});
+]]
+<WhenList> ::= <WhenList> WHEN <Expr> THEN <Expr>  [[
+    auto t = dupLex<C_LexPairList>(*$1);
+    t->m_data.emplace_back($3, $5);
+    $r = t;
+]]
+
+<Else> ::=              [[]]
+<Else> ::= ELSE <Expr>  [[
+    $r = $2;
+]]
+
+<IdRight> ::=                   [[]]
+<IdRight> ::= . <Id> <IdRight>  [[
+    auto s = bux::unlex<std::string>($2);
+    if (auto t = tryDupLex<C_StrQ>($3))
+    {
+        t->m_data.insert(t->m_data.begin(), s);
+        $r = t;
+    }
+    else
+        $r = bux::createLex<C_StrQ>({s});
+]]
+<IdRight> ::= . <WildColumn>    [[
+    $r = bux::createLex<C_StrQ>({getOp($2)});
+]]
+
+<WildColumn> ::= *      [[
+    $r = new C_OpLex("*");
+]]
+<WildColumn> ::= `*`    [[
+    $r = new C_OpLex("`*`");
+]]
+
+<UnaryOp> ::= NOT   [[
+    $r = new C_OpLex("NOT");
+]]
+<UnaryOp> ::= BINARY   [[
+    $r = new C_OpLex("BINARY");
+]]
+<UnaryOp> ::= ! [[
+    $r = new C_OpLex("!");
+]]
+<UnaryOp> ::= + [[
+    $r = new C_OpLex("+");
+]]
+<UnaryOp> ::= - [[
+    $r = new C_OpLex("-");
+]]
+
+<SelectExprList> ::= <SelectExpr>   [[
+    $r = bux::createLex<C_LexList>({$1});
+]]
+<SelectExprList> ::= <SelectExprList> , <SelectExpr>    [[
+    auto t = dupLex<C_LexList>(*$1);
+    t->m_data.emplace_back($3);
+    $r = t;
+]]
+
+<SelectExpr> ::= <Expr>         [[
+    $r = $1;
+]]
+<SelectExpr> ::= <Expr> <AsId>  [[
+    auto &as = bux::unlex<std::pair<bool,std::string>>($2);
+    $r = new C_AliasedExpr($1, as.second, as.first);
+]]
+
+<AsId> ::= <Id>     [[
+    $r = bux::createLex<std::pair<bool,std::string>>(false, bux::unlex<std::string>($1));
+]]
+<AsId> ::= AS <Id>  [[
+    $r = bux::createLex<std::pair<bool,std::string>>(true, bux::unlex<std::string>($2));
+]]
+
+<ParamList> ::= DISTINCT <NonEmptyExprList> [[
+    auto t = dupLex<C_LexList>(*$2);
+    t->m_data.emplace_front(new bux::I_LexAttr);
+    $r = t;
+]]
+<ParamList> ::= <ExprList>  [[
+    $r = $1;
+]]
+
+<ExprList> ::=                      [[]]
+<ExprList> ::= <NonEmptyExprList>   [[
+    $r = $1;
+]]
+
+<NonEmptyExprList> ::= <Expr>   [[
+    $r = bux::createLex<C_LexList>({$1});
+]]
+<NonEmptyExprList> ::= <NonEmptyExprList> , <Expr>  [[
+    auto t = dupLex<C_LexList>(*$1);
+    t->m_data.emplace_back($3);
+    $r = t;
+]]
+
+<AutoInc> ::=                   [[]]
+<AutoInc> ::= AUTO_INCREMENT    [[
+    $r = new bux::I_LexAttr;
+]]
+<AutoInc> ::= AUTOINCREMENT     [[
+    $r = new bux::I_LexAttr;
+]]
+
+<PrimaryUnique> ::= <Uniqueness>    [[
+    $r = $1;
+]]
+<PrimaryUnique> ::= PRIMARY KEY <AutoInc> [[
+    $r = bux::createLex($3? PUA_PRIMARY_KEY_AUTOINC: PUA_PRIMARY_KEY);
+]]
+<PrimaryUnique> ::= KEY             [[
+    $r = bux::createLex(PUA_PRIMARY_KEY);
+]]
+
+<Uniqueness> ::=                        [[]]
+<Uniqueness> ::= UNIQUE <RedundantKEY>  [[
+    $r = bux::createLex(PUA_UNIQUE_KEY);
+]]
+
+<RedundantKEY> ::=      [[]]
+<RedundantKEY> ::= KEY  [[]]
+
+<Comment> ::= [[]]
+<Comment> ::= COMMENT $String   [[
+    $r = $2;
+]]
+
+<ColFormat> ::= [[]]
+<ColFormat> ::= COLUMN_FORMAT <ColFormatType>   [[
+    $r = $2;
+]]
+
+<ColFormatType> ::= FIXED   [[
+    $r = bux::createLex(COLUMN_FORMAT_FIXED);
+]]
+<ColFormatType> ::= DYNAMIC [[
+    $r = bux::createLex(COLUMN_FORMAT_DYNAMIC);
+]]
+<ColFormatType> ::= DEFAULT [[
+    $r = bux::createLex(COLUMN_FORMAT_DEFAULT);
+]]
+
+<OptionalReferenceDef> ::= [[]]
+<OptionalReferenceDef> ::= <ReferenceDef>   [[
+    $r = $1;
+]]
+
+<ReferenceDef> ::= REFERENCES <TableName> ( <IndexColNameList> ) <Match> <OptionalOnEvents> [[
+    auto t = std::make_shared<C_ReferenceDef>($2, bux::unlex<C_IndexColumns>($4));
+    if ($6)
+        t->match(bux::unlex<E_MatchCond>($6));
+    if ($7)
+    {
+        const auto actions = bux::unlex<std::pair<E_EventAction,E_EventAction>>($7);
+        t->onDelete(actions.first);
+        t->onUpdate(actions.second);
+    }
+    $r = t;
+]]
+
+<OptionalOnEvents> ::=              [[]]
+<OptionalOnEvents> ::= ON <OnRest>  [[
+    $r = $2;
+]]
+
+<OnRest> ::= UPDATE <EventAction>   [[
+    $r = bux::createLex<std::pair<E_EventAction,E_EventAction>>(EA_NONE, bux::unlex<E_EventAction>($2));
+]]
+<OnRest> ::= DELETE <EventAction> <OptionalOnUpdateAction>  [[
+    $r = bux::createLex<std::pair<E_EventAction,E_EventAction>>(bux::unlex<E_EventAction>($2),
+        $3? bux::unlex<E_EventAction>($3): EA_NONE);
+]]
+
+<OptionalOnUpdateAction> ::= [[]]
+<OptionalOnUpdateAction> ::= ON UPDATE <EventAction>    [[
+    $r = $3;
+]]
+
+<Match> ::=                     [[]]
+<Match> ::= MATCH <MatchType>   [[
+    $r = $2;
+]]
+
+<MatchType> ::= FULL    [[
+    $r = bux::createLex(MATCH_FULL);
+]]
+<MatchType> ::= PARTIAL [[
+    $r = bux::createLex(MATCH_PARTIAL);
+]]
+<MatchType> ::= SIMPLE  [[
+    $r = bux::createLex(MATCH_SIMPLE);
+]]
+
+<EventAction> ::= RESTRICT  [[
+    $r = bux::createLex(EA_RESTRICT);
+]]
+<EventAction> ::= CASCADE   [[
+    $r = bux::createLex(EA_CASCADE);
+]]
+<EventAction> ::= SET NULL  [[
+    $r = bux::createLex(EA_SET_NULL);
+]]
+<EventAction> ::= NO ACTION [[
+    $r = bux::createLex(EA_NO_ACTION);
+]]
+
+<IndexColNameList> ::= <IndexColName>   [[
+    $r = bux::createLex<C_IndexColumns>({bux::unlex<C_IndexColumn>($1)});
+]]
+<IndexColNameList> ::= <IndexColNameList> , <IndexColName>  [[
+    auto dst = dupLex<C_IndexColumns>(*$1);
+    dst->m_data.emplace_back(bux::unlex<C_IndexColumn>($3));
+    $r = dst;
+]]
+
+<IndexColName> ::= <Id> <OptionalWidth> <OptionalAscDesc>   [[
+    int width = -1;
+    const char *op = nullptr;
+    if ($2)
+        width = toInt($2);
+    if ($3)
+        op = getOp($3);
+
+    $r = bux::createLex<C_IndexColumn>(bux::unlex<std::string>($1), width, op);
+]]
+
+<OptionalAscDesc> ::=           [[]]
+<OptionalAscDesc> ::= <AscDesc> [[
+    $r = $1;
+]]
+
+<AscDesc> ::= ASC   [[
+    $r = new C_OpLex("ASC");
+]]
+<AscDesc> ::= DESC  [[
+    $r = new C_OpLex("DESC");
+]]
+
+<OptionalEqSign> ::=    [[]] // ignorable
+<OptionalEqSign> ::= =  [[]] // ignorable
+
+<Id> ::= $String            [[
+    $r = bux::createLex('\'' + bux::unlex<std::string>($1) + '\'');
+]]
+<Id> ::= $Id                [[
+    $r = $1;
+]]
+// The following are MySQL non-reserved keywords from https://dev.mysql.com/doc/refman/5.7/en/keywords.html
+<Id> ::= ACTION             [[
+    $r = $1;
+]]
+<Id> ::= BIT                [[
+    $r = $1;
+]]
+<Id> ::= BOOL               [[
+    $r = $1;
+]]
+<Id> ::= BOOLEAN            [[
+    $r = $1;
+]]
+<Id> ::= BTREE              [[
+    $r = $1;
+]]
+<Id> ::= BYTE               [[
+    $r = $1;
+]]
+<Id> ::= CASCADED           [[
+    $r = $1;
+]]
+<Id> ::= CHARSET            [[
+    $r = $1;
+]]
+<Id> ::= COLUMN_FORMAT      [[
+    $r = $1;
+]]
+<Id> ::= COMMENT            [[
+    $r = $1;
+]]
+<Id> ::= DATE               [[
+    $r = $1;
+]]
+<Id> ::= DATETIME           [[
+    $r = $1;
+]]
+<Id> ::= DEFINER            [[
+    $r = $1;
+]]
+#ifdef ERR_RECOVER_
+<Id> ::= DUMPFILE           [[
+    $r = $1;
+]]
+#endif
+<Id> ::= DYNAMIC            [[
+    $r = $1;
+]]
+<Id> ::= END                [[
+    $r = $1;
+]]
+<Id> ::= ENGINE             [[
+    $r = $1;
+]]
+<Id> ::= ENUM               [[
+    $r = $1;
+]]
+<Id> ::= ESCAPE             [[
+    $r = $1;
+]]
+<Id> ::= FIXED              [[
+    $r = $1;
+]]
+<Id> ::= FULL               [[
+    $r = $1;
+]]
+<Id> ::= GEOMETRY           [[
+    $r = $1;
+]]
+<Id> ::= GEOMETRYCOLLECTION [[
+    $r = $1;
+]]
+<Id> ::= HASH               [[
+    $r = $1;
+]]
+<Id> ::= KEY_BLOCK_SIZE     [[
+    $r = $1;
+]]
+<Id> ::= LINESTRING         [[
+    $r = $1;
+]]
+<Id> ::= LOCAL              [[
+    $r = $1;
+]]
+<Id> ::= MERGE              [[
+    $r = $1;
+]]
+<Id> ::= MULTILINESTRING    [[
+    $r = $1;
+]]
+<Id> ::= MULTIPOINT         [[
+    $r = $1;
+]]
+<Id> ::= MULTIPOLYGON       [[
+    $r = $1;
+]]
+<Id> ::= MODE               [[
+    $r = $1;
+]]
+<Id> ::= NATIONAL           [[
+    $r = $1;
+]]
+<Id> ::= NCHAR              [[
+    $r = $1;
+]]
+<Id> ::= NO                 [[
+    $r = $1;
+]]
+<Id> ::= OFFSET             [[
+    $r = $1;
+]]
+<Id> ::= PARSER             [[
+    $r = $1;
+]]
+<Id> ::= PARTIAL            [[
+    $r = $1;
+]]
+<Id> ::= POINT              [[
+    $r = $1;
+]]
+<Id> ::= POLYGON            [[
+    $r = $1;
+]]
+<Id> ::= ROLLUP             [[
+    $r = $1;
+]]
+<Id> ::= RTREE              [[
+    $r = $1;
+]]
+<Id> ::= SECURITY           [[
+    $r = $1;
+]]
+<Id> ::= SHARE              [[
+    $r = $1;
+]]
+<Id> ::= SIMPLE             [[
+    $r = $1;
+]]
+<Id> ::= SQL_BUFFER_RESULT  [[
+    $r = $1;
+]]
+<Id> ::= SQL_CACHE          [[
+    $r = $1;
+]]
+<Id> ::= SQL_NO_CACHE       [[
+    $r = $1;
+]]
+<Id> ::= STORAGE            [[
+    $r = $1;
+]]
+<Id> ::= TEMPORARY          [[
+    $r = $1;
+]]
+<Id> ::= TEMPTABLE          [[
+    $r = $1;
+]]
+<Id> ::= TIME               [[
+    $r = $1;
+]]
+<Id> ::= TIMESTAMP          [[
+    $r = $1;
+]]
+<Id> ::= UNDEFINED          [[
+    $r = $1;
+]]
+<Id> ::= VIEW               [[
+    $r = $1;
+]]
+<Id> ::= YEAR               [[
+    $r = $1;
+]]

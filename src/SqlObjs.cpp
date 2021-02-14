@@ -402,7 +402,7 @@ void C_CreateTable::removeColumns(std::function<bool(const std::string &)> match
         else if (auto key = dynamic_cast<const C_ConstraintDef*>(i->get()))
         {
             // Collect indices of  erased columns
-            std::vector<size_t> eraseInd;
+            std::vector<std::ptrdiff_t> eraseInd;
             auto &cols = key->columns();
             for (size_t j = cols.size(); j--;)
                 if (match(bareID(cols[j].m_name)))

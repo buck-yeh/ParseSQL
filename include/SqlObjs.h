@@ -181,7 +181,9 @@ enum E_PrimaryUniqueAttr
 {
     PUA_NONE,
     PUA_PRIMARY_KEY,
-    PUA_UNIQUE_KEY
+    PUA_UNIQUE_KEY,
+    //-------------------------
+    PUA_MAX = 255   // to suppress warnings from implementation details of the generated parser
 };
 
 enum E_ColFormat

@@ -1,5 +1,4 @@
-#ifndef ParseSQLH
-#define ParseSQLH
+#pragma once
 
 #include "SqlObjs.h"    // I_SqlCmd, F_Str2Str, C_ClauseAsCmd
 
@@ -43,5 +42,3 @@ T *sql_cast(const C_SqlCmdPtr &ptr)
     }
     return {};
 }
-
-#endif // ParseSQLH

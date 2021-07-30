@@ -1,0 +1,13 @@
+07/31 01:54:51 buck@prestige-buck:~/github/ParseSQL/src ./reparse 
+About to parse 'grammar.txt' ...
+Total 4 lex-symbols 134 nonterms 345 literals
+states = 63215	shifts = 868146
+Spent 4416.131405587001"
+87204 out of 868146 goto keys erased for redundancy.
+WARNING: Option %ERROR_TOKEN defined but not used !
+Press a key to continue ...
+Parser created
+#pos_args = 4
+About to parse '../../parsergen/ScannerGen/RE_Suite.txt' ...
+About to parse 'tokens.txt' ...
+

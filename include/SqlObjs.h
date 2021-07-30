@@ -1,5 +1,4 @@
-#ifndef SqlObjsH
-#define SqlObjsH
+#pragma once
 
 #include "SqlFwd.h"     // E_SqlServerType
 //------------------------------------------------
@@ -969,5 +968,3 @@ private:
 std::string bareID(const std::string &id);
 const char *typeName(E_DataType type);
 bool isTimestamp(const bux::I_LexAttr *lex);
-
-#endif // SqlObjsH

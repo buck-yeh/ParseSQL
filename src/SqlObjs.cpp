@@ -103,7 +103,7 @@ std::string expr2str(const C_LexPtr &expr, E_SqlServerType type, F_Str2Str t2s)
     }
 
     // Neither a phrase(id, null, function, ...) nor an integer nor a string
-    LOGIC_ERROR(HRTN(*expr)+" not expression type");
+    LOGIC_ERROR("{} not expression type", HRTN(*expr));
 }
 
 template<class T>
@@ -111,7 +111,7 @@ void assignLex(std::shared_ptr<const T> &lval, C_LexPtr &rval, const char *error
 {
     lval = std::dynamic_pointer_cast<const T>(rval);
     if (!lval)
-        LOGIC_ERROR(HRTN(*rval)+errorSuffix);
+        LOGIC_ERROR("{}{}", HRTN(*rval), errorSuffix);
 }
 
 bool hasAutoInc(const C_ColumnBaseDef &col)

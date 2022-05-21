@@ -31,8 +31,13 @@ IF(CMAKE_CXX_COMPILER_ID MATCHES Clang|GNU)
     ELSE()
         message("Else 1/2")
     ENDIF()
+
+    IF(DEFINED FETCH_DEPENDEES)
+        string(APPEND CMAKE_CXX_FLAGS " -I${fetchedbux_SOURCE_DIR}/include -L${fetchedbux_SOURCE_DIR}/src")
+    ENDIF()
 ELSE()
     message("Else 2/2")
 ENDIF()
+message("Root/CMAKE_CXX_FLAGS = ${CMAKE_CXX_FLAGS}")
 
 add_subdirectory (src)

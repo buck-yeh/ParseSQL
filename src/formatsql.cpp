@@ -3,8 +3,8 @@
 #include "Scanner.h"        // C_SQLScanner
 #include "SqlObjs.h"        // I_SqlCmd
 //------------------------------------------------
-#include "bux/LogStream.h"  // HRTN()
 #include "bux/MemIn.h"      // bux::C_IMemStream
+#include "bux/StrUtil.h"    // HRTN()
 #include <fstream>          // std::ifstream
 #include <iostream>         // std::cout
 

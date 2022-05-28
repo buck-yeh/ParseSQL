@@ -1,6 +1,6 @@
 #include "SqlObjs.h"
 //----------------------------------------------------------
-#include "bux/LogStream.h"  // HRTN()
+#include "bux/StrUtil.h"    // HRTN()
 #include "bux/XException.h" // LOGIC_ERROR(), RUNTIME_ERROR()
 #include <cstring>          // strcmp()
 #ifdef _WIN32

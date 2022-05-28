@@ -21,7 +21,7 @@ str_as_id   = '\'' [^'\'']+ '\''                    >>bux::createEscapeString<TI
 %HEADERS_FOR_CPP [[
 #include "SqlObjs.h"
 //--------------------------------------------------
-#include <bux/LogStream.h>  // HRTN()
+#include <bux/StrUtil.h>    // HRTN()
 #include <optional>         // std::optional<>
 ]]
 %LOCAL_CPP [[
